@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+backend/.venv/
+*.pth
+*.pkl
+
+# Node
+node_modules/
+frontend/dist/
+frontend/.vite/
+*.tsbuildinfo
+
+# Models cache
+.cache/
+models--*/
+training/outputs/
+backend/models/lora/
+backend/models/controlnet/
+
+# IDE / OS
+.ipynb_checkpoints/
+.DS_Store
+*.log
