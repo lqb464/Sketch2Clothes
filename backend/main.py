@@ -3,7 +3,7 @@ import json
 import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from config import DEVICE, PORT, RESOLUTION
@@ -79,12 +79,59 @@ async def health():
     }
 
 
+from pydantic import BaseModel
+
+class GenerateRequest(BaseModel):
+    sketch: str  # base64 encoded image
+    category: str = "shirt"
+    style: str = ""
+
+
 @app.get("/api/models/status")
 async def models_status():
     return {
         "loaded": engine.is_loaded if engine else False,
         "mode": engine.mode if engine else "unknown",
     }
+
+
+@app.post("/api/generate")
+async def http_generate(body: GenerateRequest):
+    global engine
+    if engine is None:
+        raise HTTPException(status_code=500, detail="Engine not initialized")
+
+    try:
+        sketch = decode_sketch_b64(body.sketch)
+        if is_blank_sketch(sketch):
+            raise HTTPException(status_code=400, detail="Sketch trống — hãy vẽ trước khi sinh ảnh")
+
+        prompt = build_prompt(body.category, body.style)
+
+        async with load_lock:
+            if not engine.is_loaded:
+                await engine.load()
+
+        request_id = str(uuid.uuid4())
+        final_image_b64 = None
+
+        # Iterate over generation events to find the final image
+        async for event in engine.generate(sketch, prompt, request_id):
+            if event.type == "image":
+                final_image_b64 = event.image_b64
+
+        if not final_image_b64:
+            raise HTTPException(status_code=500, detail="Sinh ảnh không thành công — không có kết quả trả về")
+
+        return {
+            "image": final_image_b64,
+            "category": body.category,
+            "style": body.style,
+            "mode": engine.mode
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
 
 
 @app.websocket("/ws/generate")
