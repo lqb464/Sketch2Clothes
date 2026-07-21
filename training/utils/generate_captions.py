@@ -69,40 +69,6 @@ def _is_florence(model_id: str) -> bool:
     return "florence" in model_id.lower()
 
 
-def _ensure_flash_attn_optional() -> None:
-    """Florence-2 remote code may hard-require flash_attn; stub it so eager/sdpa works on Kaggle."""
-    try:
-        import flash_attn  # noqa: F401
-
-        return
-    except Exception:
-        pass
-
-    import types
-
-    stub = types.ModuleType("flash_attn")
-    stub.__version__ = "2.5.0"
-    sys.modules["flash_attn"] = stub
-    for name in (
-        "flash_attn.flash_attn_interface",
-        "flash_attn.bert_padding",
-        "flash_attn.layers",
-        "flash_attn.layers.rotary",
-    ):
-        mod = types.ModuleType(name)
-        sys.modules[name] = mod
-
-    # Satisfy transformers availability checks without a real CUDA wheel.
-    try:
-        import transformers.utils.import_utils as import_utils
-
-        import_utils._flash_attn_2_available = True  # type: ignore[attr-defined]
-        import_utils.is_flash_attn_2_available = lambda: True  # type: ignore[assignment]
-        import_utils.is_flash_attn_greater_or_equal_2_10 = lambda: True  # type: ignore[assignment]
-    except Exception:
-        pass
-
-
 def _patch_florence_config_compat() -> None:
     """Newer transformers removed auto attrs like forced_bos_token_id; Florence remote code still reads them."""
     try:
@@ -127,31 +93,47 @@ def _patch_florence_config_compat() -> None:
         pass
 
 
+def _fixed_florence_get_imports(filename):  # type: ignore[no-untyped-def]
+    """Strip flash_attn from Florence remote-code import checks (not needed for eager/sdpa)."""
+    from transformers.dynamic_module_utils import get_imports
+
+    imports = get_imports(filename)
+    if str(filename).endswith("modeling_florence2.py") and "flash_attn" in imports:
+        imports = [pkg for pkg in imports if pkg != "flash_attn"]
+    return imports
+
+
 def _load_florence(model_id: str, device: str):
-    _ensure_flash_attn_optional()
-    _patch_florence_config_compat()
+    # Florence's modeling_florence2.py lists flash_attn as required even though eager/sdpa work.
+    # Stubbing flash_attn breaks transformers package checks (__spec__ is None). Patch imports instead:
+    # https://github.com/huggingface/transformers/issues/31793
+    from unittest.mock import patch
+
     from transformers import AutoModelForCausalLM, AutoProcessor
 
+    _patch_florence_config_compat()
     dtype = torch.float16 if device == "cuda" else torch.float32
-    processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
-    # Prefer eager/sdpa — flash_attn wheels rarely build on Kaggle.
-    model = None
-    last_err: Exception | None = None
-    for attn_impl in ("eager", "sdpa", None):
-        try:
-            kwargs = {
-                "torch_dtype": dtype,
-                "trust_remote_code": True,
-            }
-            if attn_impl is not None:
-                kwargs["attn_implementation"] = attn_impl
-            model = AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
-            break
-        except Exception as e:
-            last_err = e
-            continue
-    if model is None:
-        raise RuntimeError(f"Failed to load Florence-2: {last_err}")
+
+    with patch("transformers.dynamic_module_utils.get_imports", _fixed_florence_get_imports):
+        processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+        last_err: Exception | None = None
+        model = None
+        for attn_impl in ("eager", "sdpa"):
+            try:
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_id,
+                    torch_dtype=dtype,
+                    trust_remote_code=True,
+                    attn_implementation=attn_impl,
+                )
+                print(f"[+] Florence-2 loaded with attn_implementation={attn_impl}", flush=True)
+                break
+            except Exception as e:
+                last_err = e
+                print(f"[!] attn_implementation={attn_impl} failed: {e}", flush=True)
+        if model is None:
+            raise RuntimeError(f"Failed to load Florence-2: {last_err}")
+
     model = model.to(device)
     model.eval()
     return processor, model, "florence"
